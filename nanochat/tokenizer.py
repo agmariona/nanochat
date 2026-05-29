@@ -385,22 +385,105 @@ class RustBPETokenizer:
         return ids
 
 # -----------------------------------------------------------------------------
+# Byte-level Tokenizer for Byte Latent Transformer
+
+class ByteTokenizer:
+    def __init__(self):
+        self._special_tokens = {
+            tok: 256+i for i, tok in enumerate(SPECIAL_TOKENS)
+        }
+        self._special_ids = {v: k for k, v in self._special_tokens.items()}
+
+    def get_vocab_size(self):
+        return 256 + len(self._special_tokens)
+
+    def get_special_tokens(self):
+        return list(self._special_tokens)
+
+    def id_to_token(self, id):
+        if id in self._special_ids:
+            return self._special_ids[id]
+        return self.decode([id])
+
+    def encode_special(self, s):
+        if s not in self._special_tokens:
+            raise KeyError(f"Invalid special token: {s}")
+        return self._special_tokens[s]
+
+    def get_bos_token_id(self) -> int:
+        return self._special_tokens["<|bos|>"]
+
+    def encode(self, text, *args, **kwargs):
+        if isinstance(text, str):
+            return self._encode_one(text, *args, **kwargs)
+        elif isinstance(text, list):
+            return [self._encode_one(t, *args, **kwargs) for t in text]
+        else:
+            raise ValueError(f"Invalid input type: {type(text)}")
+
+    def _encode_one(self, text, prepend=None, append=None, num_threads=None):
+        if not isinstance(text, str):
+            raise ValueError(f"Invalid input type: {type(text)}")
+        ids = []
+        if prepend is not None:
+            prepend_id = prepend if isinstance(prepend, int) else \
+                self.encode_special(prepend)
+            ids.append(prepend_id)
+
+        ids.extend(text.encode("utf-8"))
+
+        if append is not None:
+            append_id = append if isinstance(append, int) else \
+                self.encode_special(append)
+            ids.append(append_id)
+            return ids
+
+        return ids
+
+    def __call__(self, *args, **kwargs):
+        return self.encode(*args, **kwargs)
+
+    def decode(self, ids):
+        if ids and (max(ids) >= self.get_vocab_size() or min(ids) < 0):
+            raise ValueError(f"Invalid id: {max(ids)}")
+        ids = [id for id in ids if id < 256]
+        return bytes(ids).decode("utf-8", errors="replace")
+
+# -----------------------------------------------------------------------------
 # nanochat-specific convenience functions
 
-def get_tokenizer():
+def get_tokenizer(tokenizer_type="RustBPE"):
     from nanochat.common import get_base_dir
     base_dir = get_base_dir()
     tokenizer_dir = os.path.join(base_dir, "tokenizer")
-    # return HuggingFaceTokenizer.from_directory(tokenizer_dir)
-    return RustBPETokenizer.from_directory(tokenizer_dir)
 
-def get_token_bytes(device="cpu"):
+    if tokenizer_type == "HuggingFace":
+        return HuggingFaceTokenizer.from_directory(tokenizer_dir)
+    elif tokenizer_type == "RustBPE":
+        return RustBPETokenizer.from_directory(tokenizer_dir)
+    elif tokenizer_type == "Byte":
+        return ByteTokenizer()
+    else:
+        raise ValueError(f"Invalid tokenizer type: {tokenizer_type}")
+
+def get_token_bytes(tokenizer, device="cpu"):
     import torch
-    from nanochat.common import get_base_dir
-    base_dir = get_base_dir()
-    tokenizer_dir = os.path.join(base_dir, "tokenizer")
-    token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
-    assert os.path.exists(token_bytes_path), f"Token bytes not found at {token_bytes_path}? It gets written by tok_train.py"
-    with open(token_bytes_path, "rb") as f:
-        token_bytes = torch.load(f, map_location=device)
+    if isinstance(tokenizer, ByteTokenizer):
+        token_bytes = torch.zeros(
+            tokenizer.get_vocab_size(),
+            dtype=torch.int32,
+            device=device
+        )
+        token_bytes[:256] = 1   # non-special tokens correspond to 1 byte
+    elif isinstance(tokenizer, RustBPETokenizer):
+        from nanochat.common import get_base_dir
+        base_dir = get_base_dir()
+        tokenizer_dir = os.path.join(base_dir, "tokenizer")
+        token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
+        assert os.path.exists(token_bytes_path), f"Token bytes not found at {token_bytes_path}? It gets written by tok_train.py"
+        with open(token_bytes_path, "rb") as f:
+            token_bytes = torch.load(f, map_location=device)
+    else:
+        raise ValueError(f"Invalid tokenizer type: {type(tokenizer)}")
+
     return token_bytes

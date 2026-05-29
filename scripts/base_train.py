@@ -46,6 +46,11 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
+# Tokenizer
+parser.add_argument("--tokenizer-type", type=str, default="RustBPE",
+    choices=["RustBPE", "Byte"],
+    help="Tokenizer: BPE (default) or Byte (for BLT)"
+)
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
@@ -97,7 +102,15 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+if use_dummy_wandb:
+    wandb_run = DummyWandb()
+else:
+    wandb_run = wandb.init(
+        project="nanochat",
+        name=args.run,
+        config=user_config
+    )
+    wandb.define_metric("*", step_metric="step")
 
 # Flash Attention status
 from nanochat.flash_attention import USE_FA3
@@ -118,9 +131,10 @@ else:
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
-tokenizer = get_tokenizer()
-token_bytes = get_token_bytes(device=device)
+tokenizer = get_tokenizer(tokenizer_type=args.tokenizer_type)
+token_bytes = get_token_bytes(tokenizer, device=device)
 vocab_size = tokenizer.get_vocab_size()
+print0(f"Tokenizer: {args.tokenizer_type}")
 print0(f"Vocab size: {vocab_size:,}")
 
 # -----------------------------------------------------------------------------
@@ -158,6 +172,13 @@ resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    # check for tokenizer mismatch
+    tk_type = meta_data.get("user_config", {}).get("tokenizer_type", "RustBPE")
+    if tk_type != args.tokenizer_type:
+        raise ValueError(
+            f"Configuration tokenizer {args.tokenizer_type} must match "
+            f"checkpoint tokenizer {tk_type}"
+        )
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
