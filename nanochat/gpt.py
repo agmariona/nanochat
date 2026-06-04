@@ -12,14 +12,14 @@ Notable features:
 - Flash Attention 3 integration
 """
 
-from functools import partial
 from dataclasses import dataclass
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nanochat.transformer import norm, has_ve, Linear, Block
+from nanochat.transformer import norm, Linear, TransformerTrunk
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW, DistMuonAdamW
 
@@ -40,6 +40,7 @@ class GPTConfig:
     #   "SL"=alternating,
     #   "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    use_value_embeddings: bool = True
 
 
 class GPT(nn.Module):
@@ -57,11 +58,6 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
 
-        # Compute per-layer window sizes for sliding window attention
-        # window_size is (left, right) tuple:
-        #   (-1, 0) for full context, (N, 0) for sliding window
-        self.window_sizes = self._compute_window_sizes(config)
-
         # Pad vocab for efficiency (DDP, tensor cores). This is just an
         # optimization - outputs are cropped in forward().
         # https://huggingface.co/docs/transformers/main_classes/
@@ -74,57 +70,18 @@ class GPT(nn.Module):
                 f"to {padded_vocab_size} for efficiency"
             )
 
-        self.transformer = nn.ModuleDict({
-            "wte": nn.Embedding(padded_vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, layer_idx) \
-                for layer_idx in range(config.n_layer)]),
-        })
+        self.wte = nn.Embedding(padded_vocab_size, config.n_embd)
+        if config.use_value_embeddings:
+            n_value_embeddings = padded_vocab_size
+        else:
+            n_value_embeddings = None
+        self.trunk = TransformerTrunk(config, n_value_embeddings)
         self.lm_head = Linear(config.n_embd, padded_vocab_size, bias=False)
-
-        # Per-layer learnable scalars (inspired by modded-nanogpt)
-        # resid_lambdas:
-        #   scales the residual stream at each layer (init 1.0 = neutral)
-        # x0_lambdas:
-        #   blends initial embedding back in at each layer (init 0.0 = disabled)
-        # Separate parameters so they can have different optimizer treatment
-        # fake inits, real init in init_weights()
-        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
 
         # Smear: mix previous token's embedding into current token
         #    (cheap bigram-like info)
         self.smear_gate = Linear(24, 1, bias=False)
         self.smear_lambda = nn.Parameter(torch.zeros(1))
-
-        # Backout:
-        #   subtract cached mid-layer residual before final norm to remove
-        #   low-level features
-        self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
-
-        # Value embeddings (ResFormer-style):
-        #   alternating layers, last layer always included
-        head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({
-            str(i): nn.Embedding(padded_vocab_size, kv_dim) \
-                for i in range(config.n_layer) if has_ve(i, config.n_layer)
-        })
-
-        # To support meta device initialization, we init the rotary embeddings
-        # here, but it's just "fake" meta tensors only.
-        # As for rotary_seq_len, these rotary embeddings are pretty small/cheap
-        # in memory, so let's just over-compute them by 10X, but assert fail if
-        # we ever reach that amount.
-        # In the future we can dynamically grow the cache, for now it's fine.
-        # 10X over-compute should be enough, TODO make nicer?
-        self.rotary_seq_len = config.sequence_len * 10
-        head_dim = config.n_embd // config.n_head
-        cos, sin = self._precompute_rotary_embeddings(
-            self.rotary_seq_len, head_dim)
-
-        # persistent=False means it's not saved to the checkpoint
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
 
     @torch.no_grad()
     def init_weights(self):
@@ -143,133 +100,25 @@ class GPT(nn.Module):
         """
 
         # Embedding and unembedding
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.8)
+        torch.nn.init.normal_(self.wte.weight, mean=0.0, std=0.8)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
 
-        # Transformer blocks:
-        #   uniform init with bound = sqrt(3) * std
-        #       (same standard deviation as normal)
-        n_embd = self.config.n_embd
-        # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
-        s = 3**0.5 * n_embd**-0.5
-        for block in self.transformer.h:
-            # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+        # Transformer trunk
+        self.trunk.init_weights()
 
-            # projections are zero
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
-
-            # 0.4x init scale for c_fc
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s * 0.4, s * 0.4)
-
-        # Per-layer scalars
-        # Per-layer resid init:
-        #   stronger residual at early layers, weaker at deep layers
-        n_layer = self.config.n_layer
-        for i in range(n_layer):
-            self.resid_lambdas.data[i] = 1.15 - (0.10 * i / max(n_layer - 1, 1))
-
-        # Decaying x0 init: earlier layers get more input embedding blending
-        for i in range(n_layer):
-            self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
-
-        # Smear/backout scalars and smear gate must be explicitly initialized
+        # Smear scalars and smear gate must be explicitly initialized
         torch.nn.init.zeros_(self.smear_lambda)
-        torch.nn.init.constant_(self.backout_lambda, 0.2)
         torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
-
-        # Value embeddings (init like c_v: uniform with same std)
-        for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
-
-        # Gate weights init with small positive values so gates start slightly
-        # above neutral
-        for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
-
-        # Rotary embeddings
-        head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(
-            self.rotary_seq_len, head_dim)
-        self.cos, self.sin = cos, sin
 
         # Cast embeddings to COMPUTE_DTYPE: optimizer can tolerate
         # reduced-precision embeddings and it saves memory.
         # Exception: fp16 requires fp32 embeddings because GradScaler cannot
         # unscale fp16 gradients.
         if COMPUTE_DTYPE != torch.float16:
-            self.transformer.wte.to(dtype=COMPUTE_DTYPE)
-            for ve in self.value_embeds.values():
-                ve.to(dtype=COMPUTE_DTYPE)
-
-    def _precompute_rotary_embeddings(
-        self,
-        seq_len,
-        head_dim,
-        base=100000,
-        device=None
-    ):
-        # TODO: bump base theta more? e.g. 100K is more common more recently
-        # autodetect the device from model embeddings
-        if device is None:
-            device = self.transformer.wte.weight.device
-        # stride the channels
-        channel_range = torch.arange(
-            0, head_dim, 2, dtype=torch.float32, device=device)
-        inv_freq = 1.0 / (base ** (channel_range / head_dim))
-        # stride the time steps
-        t = torch.arange(seq_len, dtype=torch.float32, device=device)
-        # calculate the rotation frequencies at each (time, channel) pair
-        freqs = torch.outer(t, inv_freq)
-        cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.to(COMPUTE_DTYPE), sin.to(COMPUTE_DTYPE)
-
-        # add batch and head dims for later broadcasting
-        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
-        return cos, sin
-
-    def _compute_window_sizes(self, config):
-        """
-        Compute per-layer window sizes for sliding window attention.
-
-        Returns list of (left, right) tuples for FA3's window_size parameter:
-        - left: how many tokens before current position to attend to
-            (-1 = unlimited)
-        - right: how many tokens after current position to attend to
-            (0 for causal)
-
-        Pattern string is tiled across layers.
-        Final layer always gets L (full context).
-        Characters: L=long (full context), S=short (quarter context)
-        """
-        pattern = config.window_pattern.upper()
-        assert (
-            all(c in "SL" for c in pattern)
-        ), f"Invalid window_pattern: {pattern}. Use only S and L."
-
-        # Map characters to window sizes
-        long_window = config.sequence_len
-        # ceil to FA3 tile size (2048 -> 768)
-        short_window = -(-long_window // 4 // 128) * 128
-        char_to_window = {
-            "L": (long_window, 0),
-            "S": (short_window, 0),
-        }
-        # Tile pattern across layers
-        window_sizes = []
-        for layer_idx in range(config.n_layer):
-            char = pattern[layer_idx % len(pattern)]
-            window_sizes.append(char_to_window[char])
-        # Final layer always gets full context
-        window_sizes[-1] = (long_window, 0)
-        return window_sizes
+            self.wte.to(dtype=COMPUTE_DTYPE)
 
     def get_device(self):
-        return self.transformer.wte.weight.device
+        return self.wte.weight.device
 
     def estimate_flops(self):
         """
@@ -295,31 +144,19 @@ class GPT(nn.Module):
                 (a little sus and very tiny => we ignore)
         """
         nparams = sum(p.numel() for p in self.parameters())
+        trunk_params = sum(p.numel() for p in self.trunk.parameters())
 
-        # Exclude non-matmul params: embeddings and per-layer scalars
-        value_embeds_numel = sum(
-            ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (
-            self.transformer.wte.weight.numel() +
-            value_embeds_numel +
-            self.resid_lambdas.numel() +
-            self.x0_lambdas.numel() +
+        gpt_params = nparams - trunk_params
+        gpt_exclude_params = (
+            self.wte.weight.numel() +
             self.smear_gate.weight.numel() +
-            self.smear_lambda.numel() +
-            self.backout_lambda.numel()
+            self.smear_lambda.numel()
         )
 
-        h = self.config.n_head
-        q = self.config.n_embd // self.config.n_head
-        t = self.config.sequence_len
-
-        # Sum attention FLOPs per layer, accounting for sliding window
-        attn_flops = 0
-        for window_size in self.window_sizes:
-            window = window_size[0]  # (left, right) tuple, we use left
-            effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
+        num_flops_per_token = (
+            self.trunk.estimate_flops() +
+            6 * (gpt_params - gpt_exclude_params)
+        )
         return num_flops_per_token
 
     def num_scaling_params(self):
@@ -337,28 +174,21 @@ class GPT(nn.Module):
         scaling laws.
         """
         # Count each group separately (mirrors the grouping in setup_optimizers)
-        wte = sum(p.numel() for p in self.transformer.wte.parameters())
-        value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
+        wte = sum(p.numel() for p in self.wte.parameters())
+        trunk_params = self.trunk.num_scaling_params()
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(
-            p.numel() for p in self.transformer.h.parameters())
-        scalars = (
-            self.resid_lambdas.numel() +
-            self.x0_lambdas.numel() +
-            self.smear_gate.weight.numel() +
-            self.smear_lambda.numel() +
-            self.backout_lambda.numel()
-        )
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        scalars = self.smear_gate.weight.numel() + self.smear_lambda.numel()
+
+        total = wte + lm_head + scalars + trunk_params['total']
         assert (
             total == sum(p.numel() for p in self.parameters())
         ), "Parameter count mismatch"
         return {
             'wte': wte,
-            'value_embeds': value_embeds,
+            'value_embeds': trunk_params['value_embeds'],
             'lm_head': lm_head,
-            'transformer_matrices': transformer_matrices,
-            'scalars': scalars,
+            'transformer_matrices': trunk_params['transformer_matrices'],
+            'scalars': scalars + trunk_params['scalars'],
             'total': total,
         }
 
@@ -374,17 +204,17 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
+        embedding_params = list(self.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
+        matrix_params = self.trunk.matrix_params()
+        value_embeds_params = self.trunk.value_embeds_params()
+        trunk_scalar_params = self.trunk.scalar_params()
+        resid_params = trunk_scalar_params["resid"]
+        x0_params = trunk_scalar_params["x0"]
         smear_params = [
             self.smear_gate.weight,
             self.smear_lambda,
-            self.backout_lambda
-        ]
+        ] + trunk_scalar_params["backout"]    # legacy grouping
 
         assert len(list(self.parameters())) == (
             len(matrix_params) +
@@ -446,7 +276,8 @@ class GPT(nn.Module):
             param_groups.append(dict(
                 kind='muon', params=group_params,
                 lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
+                momentum=0.95, ns_steps=5, beta2=0.9,
+                weight_decay=weight_decay,
             ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
@@ -458,29 +289,8 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
 
-        # Grab the rotary embeddings for the current sequence length
-        #   (they are of shape (1, seq_len, 1, head_dim/2))
-        assert T <= self.cos.size(1), (
-            "Sequence length grew beyond the rotary embeddings cache: "
-            f"{T} > {self.cos.size(1)}"
-        )
-        assert idx.device == self.cos.device, (
-            "Rotary embeddings and idx are on different devices: "
-            f"{idx.device} != {self.cos.device}"
-        )
-        assert self.cos.dtype == COMPUTE_DTYPE, (
-            "Rotary embeddings must be in "
-            f"{COMPUTE_DTYPE}, got {self.cos.dtype}"
-        )
-
-        # if kv cache exists, we need to offset the rotary embeddings to the
-        # current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        # truncate cache to current sequence length
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
-
         # Embed the tokens
-        x = self.transformer.wte(idx) # embed current token
+        x = self.wte(idx) # embed current token
         # ensure activations are in compute dtype
         #   (no-op usually, but active for fp16 code path)
         x = x.to(COMPUTE_DTYPE)
@@ -512,24 +322,7 @@ class GPT(nn.Module):
                 x = x + gate * x_pre_smear
 
         # Forward the trunk of the Transformer
-        x0 = x  # save initial normalized embedding for x0 residual
-        n_layer = self.config.n_layer
-        backout_layer = n_layer // 2  # cache at halfway point
-        x_backout = None
-        for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            if str(i) in self.value_embeds:
-                ve = self.value_embeds[str(i)](idx).to(x.dtype)
-            else:
-                ve = None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
-            if i == backout_layer:
-                x_backout = x
-        # Subtract mid-layer residual to remove low-level features before logit
-        # projection
-        if x_backout is not None:
-            x = x - self.backout_lambda.to(x.dtype) * x_backout
-        x = norm(x)
+        x = self.trunk(x, value_ids=idx, kv_cache=kv_cache)
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
@@ -596,3 +389,52 @@ class GPT(nn.Module):
             ids = torch.cat((ids, next_ids), dim=1)
             token = next_ids.item()
             yield token
+
+
+# ------------------------------------------------------------------------------
+# legacy state migration
+
+_EXACT_KEY_MAP = {
+    "resid_lambdas": "trunk.resid_lambdas",
+    "x0_lambdas": "trunk.x0_lambdas",
+    "backout_lambda": "trunk.backout_lambda"
+}
+_PREFIX_KEY_MAP = (
+    ("transformer.wte.", "wte."),
+    ("transformer.h.", "trunk.h."),
+    ("value_embeds.", "trunk.value_embeds."),
+)
+
+def _migrate_gpt_key(key):
+    if key in _EXACT_KEY_MAP:
+        return _EXACT_KEY_MAP[key]
+
+    for old_prefix, new_prefix in _PREFIX_KEY_MAP:
+        if key.startswith(old_prefix):
+            return new_prefix + key[len(old_prefix):]
+
+    return key
+
+def migrate_gpt_named_parameters(named_parameters):
+    return {
+        _migrate_gpt_key(name): param
+        for name, param in named_parameters
+    }
+
+def migrate_gpt_state_dict(state_dict):
+    migrated_state_dict = OrderedDict()
+    for key, value in state_dict.items():
+        new_key = _migrate_gpt_key(key)
+        if new_key in migrated_state_dict:
+            raise KeyError(
+                f"State dict migration collision: {key} -> {new_key}"
+            )
+        migrated_state_dict[new_key] = value
+
+    if hasattr(state_dict, "_metadata"):
+        migrated_state_dict._metadata = OrderedDict(
+            (_migrate_gpt_key(key), value)
+            for key, value in state_dict._metadata.items()
+        )
+
+    return migrated_state_dict
