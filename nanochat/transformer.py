@@ -209,8 +209,8 @@ class TransformerTrunk(nn.Module):
         # In the future we can dynamically grow the cache, for now it's fine.
         # 10X over-compute should be enough, TODO make nicer?
         self.rotary_seq_len = config.sequence_len * 10
-        cos, sin = self._precompute_rotary_embeddings(
-            self.rotary_seq_len, head_dim)
+        cos, sin = precompute_rotary_embeddings(
+            self.get_device(), self.rotary_seq_len, head_dim)
 
         # persistent=False means it's not saved to the checkpoint
         self.register_buffer("cos", cos, persistent=False)
@@ -276,39 +276,13 @@ class TransformerTrunk(nn.Module):
 
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(
-            self.rotary_seq_len, head_dim)
+        cos, sin = precompute_rotary_embeddings(
+            self.get_device(), self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
 
         if COMPUTE_DTYPE != torch.float16:
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
-
-    def _precompute_rotary_embeddings(
-        self,
-        seq_len,
-        head_dim,
-        base=100000,
-        device=None
-    ):
-        # TODO: bump base theta more? e.g. 100K is more common more recently
-        # autodetect the device from model embeddings
-        if device is None:
-            device = self.get_device()
-        # stride the channels
-        channel_range = torch.arange(
-            0, head_dim, 2, dtype=torch.float32, device=device)
-        inv_freq = 1.0 / (base ** (channel_range / head_dim))
-        # stride the time steps
-        t = torch.arange(seq_len, dtype=torch.float32, device=device)
-        # calculate the rotation frequencies at each (time, channel) pair
-        freqs = torch.outer(t, inv_freq)
-        cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.to(COMPUTE_DTYPE), sin.to(COMPUTE_DTYPE)
-
-        # add batch and head dims for later broadcasting
-        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
-        return cos, sin
 
     def _compute_window_sizes(self, config):
         """
@@ -458,3 +432,29 @@ class TransformerTrunk(nn.Module):
         x = norm(x)
 
         return x
+
+
+def precompute_rotary_embeddings(
+    device,
+    seq_len,
+    head_dim,
+    base=100000,
+):
+    # TODO: bump base theta more? e.g. 100K is more common more recently
+    # autodetect the device from model embeddings
+    # if device is None:
+    #     device = self.get_device()
+    # stride the channels
+    channel_range = torch.arange(
+        0, head_dim, 2, dtype=torch.float32, device=device)
+    inv_freq = 1.0 / (base ** (channel_range / head_dim))
+    # stride the time steps
+    t = torch.arange(seq_len, dtype=torch.float32, device=device)
+    # calculate the rotation frequencies at each (time, channel) pair
+    freqs = torch.outer(t, inv_freq)
+    cos, sin = freqs.cos(), freqs.sin()
+    cos, sin = cos.to(COMPUTE_DTYPE), sin.to(COMPUTE_DTYPE)
+
+    # add batch and head dims for later broadcasting
+    cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+    return cos, sin
