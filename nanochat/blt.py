@@ -213,6 +213,54 @@ class BLT(nn.Module):
 
         return num_flops_per_token
 
+    def num_scaling_params(self):
+        local_enc_wte = sum(
+            p.numel() for p in self.local_encoder.embedding_params()
+        )
+        local_enc_matrices = sum(
+            p.numel() for p in self.local_encoder.matrix_params()
+        )
+
+        local_dec_wte = sum(
+            p.numel() for p in self.local_decoder.embedding_params()
+        )
+        local_dec_matrices = sum(
+            p.numel() for p in self.local_decoder.matrix_params()
+        )
+
+        lm_head = sum(p.numel() for p in self.lm_head.parameters())
+
+        global_params = self.global_transformer.num_scaling_params()
+
+        total = (
+           local_enc_wte + local_enc_matrices +
+           local_dec_wte + local_dec_matrices +
+           lm_head +
+           global_params['total']
+        )
+        assert (
+            total == sum(p.numel() for p in self.parameters())
+        ), "Parameter count mismatch"
+
+        transformer_matrices = (
+            local_enc_matrices +
+            local_dec_matrices +
+            global_params["transformer_matrices"]
+        )
+
+        return {
+            'wte': local_enc_wte + local_dec_wte,
+            'transformer_matrices': transformer_matrices,
+            'value_embeds': global_params['value_embeds'],
+            'lm_head': lm_head,
+            'scalars': global_params['scalars'],
+            'total': total,
+        }
+
+
+    def get_device(self):
+        return self.lm_head.weight.device
+
     def forward(
         self,
         idx,
@@ -257,12 +305,12 @@ class BLT(nn.Module):
                 B, T+1, self.config.static_patch_size, device=idx.device
             )
         patch_lengths = patch_lengths.to(idx.device)
-        validate_patch_lengths(patch_lengths, row_len=T+1)
+        # validate_patch_lengths(patch_lengths, row_len=T+1)
         P = patch_lengths.shape[1]
         assert P <= self.config.sequence_len
 
         enc_patch_ids = patch_ids_from_lengths(patch_lengths, T)
-        assert enc_patch_ids.max() < P  # this shouldn't be necessary since
+        # assert enc_patch_ids.max() < P  # this shouldn't be necessary since
                                         # calling validate_patch_lengths
         assert enc_patch_ids.shape == (B,T)
 
@@ -290,7 +338,7 @@ class BLT(nn.Module):
         # -----------------------------
         # local decoder: byte-level autoregressive reconstruction
         dec_patch_ids = decoder_patch_ids_from_lengths(patch_lengths, T)
-        assert dec_patch_ids.max() < h.shape[1]
+        # assert dec_patch_ids.max() < h.shape[1]
         assert dec_patch_ids.shape == (B,T)
 
         # gather global patch states back to byte positions

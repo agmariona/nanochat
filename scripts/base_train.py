@@ -58,11 +58,16 @@ parser.add_argument("--tokenizer-type", type=str, default="RustBPE",
     help="Tokenizer: BPE (default) or Byte (for BLT)"
 )
 # Model architecture
+parser.add_argument("--model-type", type=str, default="GPT",
+    choices=["GPT", "BLT"], help="model architecture"
+)
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--static-patch-size", type=int, default=8,
+    help="static patch size for BLT architecture")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -137,6 +142,10 @@ else:
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
+if args.model_type == "BLT":
+    assert (
+        args.tokenizer_type == "Byte"
+    ), "Must use Byte tokenizer with BLT architecture"
 tokenizer = get_tokenizer(tokenizer_type=args.tokenizer_type)
 token_bytes = get_token_bytes(tokenizer, device=device)
 vocab_size = tokenizer.get_vocab_size()
@@ -146,24 +155,37 @@ print0(f"Vocab size: {vocab_size:,}")
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-def build_model_meta(depth):
+def build_model_meta(depth, model_type="GPT"):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
-    config = GPTConfig(
-        sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern,
-    )
-    with torch.device("meta"):
-        model_meta = GPT(config)
+
+    if model_type == "GPT":
+        config = GPTConfig(
+            sequence_len=args.max_seq_len, vocab_size=vocab_size,
+            n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+            window_pattern=args.window_pattern,
+        )
+        with torch.device("meta"):
+            model_meta = GPT(config)
+    elif model_type == "BLT":
+        assert args.window_pattern == "L", "BLT only supports L"
+        config = BLTConfig(
+            byte_sequence_len=args.max_seq_len,
+            static_patch_size=args.static_patch_size,
+            n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+            window_pattern=args.window_pattern,
+        )
+        with torch.device("meta"):
+            model_meta = BLT(config, vocab_size)
+
     return model_meta
 
 # Build the model, move to device, init the weights
-model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
+model = build_model_meta(args.depth, args.model_type) # 1) Build on meta device (only shapes/dtypes, no data)
 model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
@@ -172,18 +194,24 @@ model.init_weights() # 3) All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
+output_dirname = args.model_tag if args.model_tag else f"{args.model_type}_d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     # check for tokenizer mismatch
+    model_type = meta_data.get("model_type", "GPT")
     tk_type = meta_data.get("user_config", {}).get("tokenizer_type", "RustBPE")
     if tk_type != args.tokenizer_type:
         raise ValueError(
             f"Configuration tokenizer {args.tokenizer_type} must match "
             f"checkpoint tokenizer {tk_type}"
+        )
+    if model_type != args.model_type:
+        raise ValueError(
+            f"Configuration architecture {args.model_type} must match "
+            f"checkpoint architecture {model_type}"
         )
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
@@ -296,7 +324,7 @@ num_scaling_params = get_scaling_params(model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
 
 # Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
-d12_ref = build_model_meta(12) # creates the model on meta device
+d12_ref = build_model_meta(12, args.model_type) # creates the model on meta device
 D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
 B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
 
@@ -510,6 +538,7 @@ while True:
             { # metadata saved as json
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
+                "model_type": args.model_type,
                 "model_config": model_config_kwargs,
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": args.device_batch_size,

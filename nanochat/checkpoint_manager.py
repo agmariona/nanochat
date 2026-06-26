@@ -10,6 +10,7 @@ import torch
 
 from nanochat.common import get_base_dir
 from nanochat.gpt import GPT, GPTConfig
+from nanochat.blt import BLT, BLTConfig
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
 
@@ -90,15 +91,37 @@ def build_model(checkpoint_dir, step, device, phase):
             k: v.float() if v.dtype == torch.bfloat16 else v
             for k, v in model_data.items()
         }
+
+    # Load the Tokenizer
+    tk_type = meta_data.get("user_config", {}).get("tokenizer_type", "RustBPE")
+    tokenizer = get_tokenizer(tokenizer_type=tk_type)
+
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
+    model_type = meta_data.get("model_type", "GPT")
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
+
     ### OLD: _patch_missing_config_keys(model_config_kwargs)
-    log0(f"Building model with config: {model_config_kwargs}")
-    model_config = GPTConfig(**model_config_kwargs)
-    ### OLD: _patch_missing_keys(model_data, model_config)
-    with torch.device("meta"):
-        model = GPT(model_config)
+    log0(f"Building {model_type} model with config: {model_config_kwargs}")
+
+    if model_type == "GPT":
+        # Sanity check: compatibility between model and tokenizer
+        assert tokenizer.get_vocab_size() == model_config_kwargs["vocab_size"], (
+            f"Tokenizer vocab size {tokenizer.get_vocab_size()}"
+            f"does not match model config vocab size"
+            f"{model_config_kwargs['vocab_size']}"
+        )
+        model_config = GPTConfig(**model_config_kwargs)
+        ### OLD: _patch_missing_keys(model_data, model_config)
+        with torch.device("meta"):
+            model = GPT(model_config)
+    elif model_type == "BLT":
+        assert tk_type == "Byte"
+        model_config = BLTConfig(**model_config_kwargs)
+        with torch.device("meta"):
+            model = BLT(model_config, tokenizer.get_vocab_size())
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
@@ -108,12 +131,16 @@ def build_model(checkpoint_dir, step, device, phase):
         model.eval()
     else:
         model.train()
-    # Load the Tokenizer
-    tk_type = meta_data.get("user_config", {}).get("tokenizer_type", "RustBPE")
-    tokenizer = get_tokenizer(tokenizer_type=tk_type)
-    # Sanity check: compatibility between model and tokenizer
-    assert tokenizer.get_vocab_size() == model_config_kwargs["vocab_size"], f"Tokenizer vocab size {tokenizer.get_vocab_size()} does not match model config vocab size {model_config_kwargs['vocab_size']}"
+
+
     return model, tokenizer, meta_data
+
+
+def parse_model_tag(model_tag):
+    match = re.fullmatch(r"(?:GPT|BLT)_d(\d+)", model_tag)
+    if match is None:
+        return None
+    return int(match.group(1))
 
 
 def find_largest_model(checkpoints_dir):
@@ -124,16 +151,21 @@ def find_largest_model(checkpoints_dir):
     # 1) normally all model tags are of the form d<number>, try that first:
     candidates = []
     for model_tag in model_tags:
-        match = re.match(r"d(\d+)", model_tag)
-        if match:
-            model_depth = int(match.group(1))
-            candidates.append((model_depth, model_tag))
+        # match = re.match(r"d(\d+)", model_tag)
+        depth = parse_model_tag(model_tag)
+        if depth is not None:
+            candidates.append((depth, model_tag))
     if candidates:
         candidates.sort(key=lambda x: x[0], reverse=True)
         return candidates[0][1]
-    # 2) if that failed, take the most recently updated model:
-    model_tags.sort(key=lambda x: os.path.getmtime(os.path.join(checkpoints_dir, x)), reverse=True)
-    return model_tags[0]
+
+    raise FileNotFoundError(
+          f"No valid checkpoints found in {checkpoints_dir}"
+    )
+
+    # OLD: 2) if that failed, take the most recently updated model:
+    # model_tags.sort(key=lambda x: os.path.getmtime(os.path.join(checkpoints_dir, x)), reverse=True)
+    # return model_tags[0]
 
 
 def find_last_step(checkpoint_dir):
