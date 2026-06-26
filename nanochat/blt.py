@@ -28,18 +28,13 @@ class BLTConfig:
     byte_sequence_len: int = 2048
     patch_mode: str = "static"
     static_patch_size: int = 8 # -1 for not static?
-    latent_sequence_len: int | None = None
 
     # global transformer
     @property
     def sequence_len(self):
-        if self.latent_sequence_len is not None:
-            return self.latent_sequence_len
-
         # compute effective latent sequence length
         assert self.patch_mode == "static"
         return 1 + math.ceil(self.byte_sequence_len / self.static_patch_size)
-
     n_layer: int = 12
     n_head: int = 6     # number of query heads
     n_kv_head: int = 6  # number of key/value heads (GQA)
@@ -87,6 +82,136 @@ class BLT(nn.Module):
         self.global_transformer = TransformerTrunk(config)
         self.local_decoder = LocalDecoder(config, byte_vocab_size)
         self.lm_head = Linear(config.n_embd, byte_vocab_size, bias=False)
+
+    @torch.no_grad()
+    def init_weights(self):
+        self.local_encoder.init_weights()
+        self.global_transformer.init_weights()
+        self.local_decoder.init_weights()
+
+        # matches GPT
+        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+
+    def setup_optimizer(
+        self,
+        unembedding_lr=0.004,
+        embedding_lr=0.2,
+        matrix_lr=0.02,
+        weight_decay=0.0,
+        scalar_lr=0.5
+    ):
+        model_dim = self.config.n_embd
+        ddp, rank, local_rank, world_size = get_dist_info()
+
+        embedding_params = (
+            self.local_encoder.embedding_params() +
+            self.local_decoder.embedding_params()
+        )
+        lm_head_params = list(self.lm_head.parameters())
+        matrix_params = (
+            self.local_encoder.matrix_params() +
+            self.global_transformer.matrix_params() +
+            self.local_decoder.matrix_params()
+        )
+
+        scalar_params = self.global_transformer.scalar_params()
+        resid_params = scalar_params["resid"]
+        x0_params = scalar_params["x0"]
+        backout_params = scalar_params["backout"]
+
+        # safety check: BLT does not use value embeddings
+        value_embeds_params = self.global_transformer.value_embeds_params()
+        assert len(value_embeds_params) == 0
+
+        # coverage check
+        all_params =(
+            embedding_params +
+            lm_head_params +
+            matrix_params +
+            resid_params +
+            x0_params +
+            backout_params
+        )
+        param_ids ={id(p) for p in all_params}
+        assert len(param_ids) == len(all_params)
+        assert param_ids == {id(p) for p in self.parameters()}
+
+        # Scale the LR for the AdamW parameters by ∝1/√dmodel
+        #   (tuned for 768 dim model)
+        dmodel_lr_scale = (model_dim / 768) ** -0.5
+        print0(
+            f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) "
+            f"= {dmodel_lr_scale:.6f}"
+        )
+
+        # Build param_groups with all required fields explicit
+        # Mirrors GPT optimizer setup
+        param_groups = [
+            # AdamW groups (embeddings, lm_head, scalars)
+            dict(
+                kind='adamw', params=lm_head_params,
+                lr=unembedding_lr * dmodel_lr_scale,
+                betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01
+            ),
+            dict(
+                kind='adamw', params=embedding_params,
+                lr=embedding_lr * dmodel_lr_scale,
+                betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001
+            ),
+            dict(
+                kind='adamw', params=resid_params,
+                lr=scalar_lr * 0.01,
+                betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05
+            ),
+            # higher beta1 for x0
+            dict(
+                kind='adamw', params=x0_params,
+                lr=scalar_lr,
+                betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0
+            ),
+            dict(
+                kind='adamw', params=backout_params,
+                lr=0.2,
+                betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0
+            ),
+        ]
+
+        # Muon groups (matrix params, grouped by shape for stacking)
+        for shape in sorted({p.shape for p in matrix_params}):
+            group_params = [p for p in matrix_params if p.shape == shape]
+            param_groups.append(dict(
+                kind='muon', params=group_params,
+                lr=matrix_lr,
+                momentum=0.95, ns_steps=5, beta2=0.9,
+                weight_decay=weight_decay,
+            ))
+
+        Factory = DistMuonAdamW if ddp else MuonAdamW
+        optimizer = Factory(param_groups)
+        for group in optimizer.param_groups:
+            group["initial_lr"] = group["lr"]
+        return optimizer
+
+    def estimate_flops(self):
+        """
+        Return estimated FLOPs per input token position, matching the GPT
+        training-loop accounting. For BLT, input token positions are byte IDs,
+        while the global transformer positions are latent patches and must be
+        scaled by tokens_per_patch.
+        """
+        tokens_per_patch = (
+            self.config.byte_sequence_len / self.config.sequence_len
+        )
+        head_params = sum(p.numel() for p in self.lm_head.parameters())
+
+        num_flops_per_token = (
+            self.local_encoder.estimate_flops() +
+            self.global_transformer.estimate_flops() / tokens_per_patch +
+            self.local_decoder.estimate_flops() +
+            6 * head_params
+        )
+
+        return num_flops_per_token
 
     def forward(
         self,
@@ -200,15 +325,6 @@ class BLT(nn.Module):
             # inference
             return logits
 
-    @torch.no_grad()
-    def init_weights(self):
-        self.local_encoder.init_weights()
-        self.global_transformer.init_weights()
-        self.local_decoder.init_weights()
-
-        # matches GPT
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-
 
 class LocalEncoder(nn.Module):
     def __init__(self, config, byte_vocab_size):
@@ -247,7 +363,9 @@ class LocalEncoder(nn.Module):
 
         if config.window_size_enc is not None:
             assert config.window_size_enc > 0
-            self.fixed_window_size = (config.window_size_enc, 0)
+            self.window_size = (config.window_size_enc, 0)
+        else:
+            self.window_size = (config.byte_sequence_len, 0)
 
     @torch.no_grad()
     def init_weights(self):
@@ -290,6 +408,23 @@ class LocalEncoder(nn.Module):
     def get_device(self):
         return self.wte.weight.device
 
+    def matrix_params(self):
+        return list(self.h.parameters())
+
+    def embedding_params(self):
+        return list(self.wte.parameters())
+
+    def estimate_flops(self):
+        nparams = sum(p.numel() for p in self.h.parameters())
+
+        h = self.enc_config.n_head
+        q = self.config.n_embd // self.enc_config.n_head
+        t = min(self.window_size[0], self.config.byte_sequence_len)
+
+        attn_flops = 12 * h * q * t * self.enc_config.n_layer
+
+        return 6 * nparams + attn_flops
+
     def forward(self, byte_tokens: torch.Tensor):
         assert byte_tokens.device == self.cos.device, (
             "Byte tokens and rotary embeddings are on different devices: "
@@ -310,18 +445,13 @@ class LocalEncoder(nn.Module):
         assert T <= self.cos.size(1)
         cos_sin = self.cos[:, :T], self.sin[:, :T]
 
-        if self.config.window_size_enc is None:
-            window_size = (T,0)     # full causal attention over current seq
-        else:
-            window_size = self.fixed_window_size
-
         # forward the causal blocks
         for block in self.h:
             x = block(
                 x,
                 ve=None,
                 cos_sin=cos_sin,
-                window_size=window_size,
+                window_size=self.window_size,
                 kv_cache=None
             )
 
@@ -367,7 +497,9 @@ class LocalDecoder(nn.Module):
 
         if config.window_size_dec is not None:
             assert config.window_size_dec > 0
-            self.fixed_window_size = (config.window_size_dec, 0)
+            self.window_size = (config.window_size_dec, 0)
+        else:
+            self.window_size = (config.byte_sequence_len, 0)
 
     @torch.no_grad()
     def init_weights(self):
@@ -410,6 +542,23 @@ class LocalDecoder(nn.Module):
     def get_device(self):
         return self.wte.weight.device
 
+    def matrix_params(self):
+        return list(self.h.parameters())
+
+    def embedding_params(self):
+        return list(self.wte.parameters())
+
+    def estimate_flops(self):
+        nparams = sum(p.numel() for p in self.h.parameters())
+
+        h = self.dec_config.n_head
+        q = self.config.n_embd // self.dec_config.n_head
+        t = min(self.window_size[0], self.config.byte_sequence_len)
+
+        attn_flops = 12 * h * q * t * self.dec_config.n_layer
+
+        return 6 * nparams + attn_flops
+
     def forward(self, byte_tokens: torch.Tensor, patch_context: torch.Tensor):
         assert byte_tokens.device == self.cos.device, (
             "Byte tokens and rotary embeddings are on different devices: "
@@ -440,18 +589,13 @@ class LocalDecoder(nn.Module):
         assert T <= self.cos.size(1)
         cos_sin = self.cos[:, :T], self.sin[:, :T]
 
-        if self.config.window_size_dec is None:
-            window_size = (T,0)     # full causal attention over current seq
-        else:
-            window_size = self.fixed_window_size
-
         # forward the causal blocks
         for block in self.h:
             x = block(
                 x,
                 ve=None,
                 cos_sin=cos_sin,
-                window_size=window_size,
+                window_size=self.window_size,
                 kv_cache=None
             )
 

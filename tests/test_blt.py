@@ -175,16 +175,21 @@ def test_blt_rejects_malformed_patch_lengths():
         model(idx, patch_lengths=bad_patch_lengths)
 
 
-def test_blt_rejects_too_many_patches():
+def test_blt_optimizer_one_step():
     byte_vocab_size = 262
     config = tiny_config()
-    config.latent_sequence_len = 2  # too small for T=16, P=1+4
     model = make_model(config, byte_vocab_size)
-    idx, _ = make_batch(
+    opt = model.setup_optimizer()
+
+    idx, targets = make_batch(
         batch_size=2,
         seq_len=16,
         byte_vocab_size=byte_vocab_size
     )
 
-    with pytest.raises(AssertionError):
-        model(idx)
+    loss = model(idx, targets)
+    loss.backward()
+    opt.step()
+    opt.zero_grad()
+
+    assert torch.isfinite(loss)
