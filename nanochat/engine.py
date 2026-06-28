@@ -136,6 +136,11 @@ class KVCache:
         if other.prev_embedding is not None:
             self.prev_embedding = other.prev_embedding.expand(self.batch_size, -1, -1).clone()
 
+        # shim for BLT
+        if hasattr(other, "blt_tokens"):
+            self.blt_tokens = other.blt_tokens.expand(
+                self.batch_size, -1).clone()
+
 # -----------------------------------------------------------------------------
 @torch.inference_mode()
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):

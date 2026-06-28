@@ -266,6 +266,7 @@ class BLT(nn.Module):
         idx,
         targets=None,
         patch_lengths=None,
+        kv_cache=None,
         loss_reduction="mean"
     ):
         """
@@ -289,6 +290,21 @@ class BLT(nn.Module):
 
         We start with a much simpler forward flow.
         """
+
+        if kv_cache is not None:
+            # these are guardrails for simplified generation-only kv cache
+            assert targets is None
+            assert patch_lengths is None
+
+            if hasattr(kv_cache, "blt_tokens"):
+                past = kv_cache.blt_tokens
+                if past.size(0) != idx.size(0):
+                    past = past.expand(idx.size(0),-1)
+                idx = torch.cat([past, idx], dim=1)
+
+            kv_cache.blt_tokens = idx.detach()
+            kv_cache.cache_seqlens.fill_(idx.size(1))
+
         B, T = idx.size()
 
         # -----------------------------
@@ -307,7 +323,7 @@ class BLT(nn.Module):
         patch_lengths = patch_lengths.to(idx.device)
         # validate_patch_lengths(patch_lengths, row_len=T+1)
         P = patch_lengths.shape[1]
-        assert P <= self.config.sequence_len
+        # assert P <= self.config.sequence_len
 
         enc_patch_ids = patch_ids_from_lengths(patch_lengths, T)
         # assert enc_patch_ids.max() < P  # this shouldn't be necessary since

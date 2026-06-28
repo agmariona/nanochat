@@ -207,7 +207,14 @@ def main():
         model_slug = args.hf_path.replace("/", "-")
     else:
         model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
-        sequence_len = meta["model_config"]["sequence_len"]
+        model_type = meta.get("model_type", "GPT")
+
+        if model_type == "GPT":
+            sequence_len = meta["model_config"]["sequence_len"]
+        elif model_type == "BLT":
+            sequence_len = meta["model_config"]["byte_sequence_len"]
+        else:
+            raise ValueError(f"Unknown model type: {model_type}")
         token_bytes = get_token_bytes(tokenizer, device=device)
         model_name = f"base_model (step {meta['step']})"
         model_slug = f"base_model_{meta['step']:06d}"
